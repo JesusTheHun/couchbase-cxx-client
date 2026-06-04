@@ -534,6 +534,13 @@ foreach(TARGET ${couchbase_cxx_client_LIBRARIES})
   target_include_directories(${TARGET} PUBLIC $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
   enable_sanitizers(${TARGET})
+  # enable_sanitizers adds -fsanitize only as INTERFACE (consumers), so the
+  # library's own TUs are NOT instrumented. Force instrumentation of the library
+  # sources so TSan can see the streams_ data race inside the orchestrator.
+  if(ENABLE_SANITIZER_THREAD)
+    target_compile_options(${TARGET} PRIVATE -fsanitize=thread -g)
+    target_link_options(${TARGET} PUBLIC -fsanitize=thread)
+  endif()
   enable_profiler(${TARGET})
   set_project_warnings(${TARGET})
   set_project_options(${TARGET})

@@ -1,79 +1,114 @@
-# Couchbase C++ client
+# Data race in `range_scan_orchestrator` — reproduction
 
-[![license](https://img.shields.io/github/license/couchbase/couchbase-cxx-client?color=brightgreen)](https://opensource.org/licenses/Apache-2.0)
-[![linters](https://img.shields.io/github/actions/workflow/status/couchbase/couchbase-cxx-client/linters.yml?branch=main&label=linters)](https://github.com/couchbase/couchbase-cxx-client/actions?query=workflow%3Alinters+branch%3Amain)
-[![sanitizers](https://img.shields.io/github/actions/workflow/status/couchbase/couchbase-cxx-client/sanitizers.yml?branch=main&label=sanitizers)](https://github.com/couchbase/couchbase-cxx-client/actions?query=workflow%3Asanitizers+branch%3Amain)
-[![tests](https://img.shields.io/github/actions/workflow/status/couchbase/couchbase-cxx-client/tests.yml?branch=main&label=tests)](https://github.com/couchbase/couchbase-cxx-client/actions?query=workflow%3Atests+branch%3Amain)
+This fork reproduces a **data race** in the KV range-scan orchestrator of
+`couchbase-cxx-client`, demonstrated with **ThreadSanitizer**.
 
-* Documentation and User Guides: https://docs.couchbase.com/cxx-sdk/current/hello-world/start-using-sdk.html
-* API Reference: https://docs.couchbase.com/sdk-api/couchbase-cxx-client
-* Issue Tracker: https://issues.couchbase.com/projects/CXXCBC/issues
-* Server Documentation: https://docs.couchbase.com/home/server.html
+| Branch | Contents |
+|--------|----------|
+| [`reproduction`](../../tree/reproduction) (this branch) | upstream `main` + a ThreadSanitizer harness that makes the race fire **deterministically** — build & run it to see the report |
+| [`main`](../../tree/main) | upstream `main` + **only the fix** (one commit) — mergeable, no harness |
 
-## Using with CPM.cmake
+The harness is test scaffolding only; the bug and the fix live entirely in stock
+`next_item()` (see below). Locking the read on this branch removes the race too
+(verified) — that single lock is exactly what `main` contains.
 
-[CMake Package Manager (CPM.cmake)](https://github.com/cpm-cmake/CPM.cmake)
-makes it easy to include the library into your project. The CMake Package
-Manager (CPM) simplifies dependency management. Use the following snippet to
-update your `CMakeLists.txt`:
+## The bug
 
-```cmake
-CPMAddPackage(
-  NAME
-  couchbase_cxx_client
-  GIT_TAG
-  1.3.1
-  VERSION
-  1.3.1
-  GITHUB_REPOSITORY
-  "couchbase/couchbase-cxx-client"
-  OPTIONS
-  "COUCHBASE_CXX_CLIENT_STATIC_BORINGSSL ON")
+`couchbase::core::range_scan_orchestrator_impl::next_item()`
+(`core/range_scan_orchestrator.cxx`) reads the `streams_` map without holding
+`stream_map_mutex_`:
+
+```cpp
+if (streams_.empty() || cancelled_) {   // <-- unlocked read of streams_
 ```
 
-If you install the library in the system using the `install` target or a package
-management system, you can use `FindPackage`:
+while the io thread mutates `streams_` **under** that lock — erase on stream
+completion:
 
-```cmake
-cmake_minimum_required(VERSION 3.19)
-
-project(minimal)
-
-find_package(couchbase_cxx_client REQUIRED)
-
-add_executable(minimal minimal.cxx)
-target_link_libraries(minimal PRIVATE couchbase_cxx_client::couchbase_cxx_client)
+```cpp
+{
+  const std::lock_guard<std::mutex> lock{ self->stream_map_mutex_ };
+  self->streams_.erase(signal.vbucket_id);
+}
 ```
 
-## Building the project
+and insert in `start_streams()`. Every access to `streams_` takes
+`stream_map_mutex_` **except** that one read. That is a data race (C++ UB).
+(`cancelled_` is `std::atomic<bool>`, so the race is purely on `streams_`.)
 
-This repository uses `CMake` for building, so everything should build once the
-basic development dependencies exist (C++17 compiler).
+In production this surfaces as an intermittent KV range scan returning one
+document short (e.g. 99 of 100) under load, even with `consistent_with` set.
 
-### Building (command-line)
+### Why it is rare (and why the harness exists)
 
-```shell
-git clone https://github.com/couchbase/couchbase-cxx-client.git
+A single consumer reads `streams_` ~once per returned document, while the io
+thread touches it thousands of times per scan, so the consumer's unlocked read is
+almost always evicted from ThreadSanitizer's shadow memory before a write checks
+against it — exactly why this is a rare production flake. To make it
+**deterministic**, the harness adds a helper thread that performs the *same*
+unlocked read continuously (both the real `next_item()` read and the helper go
+through one `streams_empty()` accessor). The bug and the fix live entirely in
+stock `next_item()`; the helper is test scaffolding only.
+
+## The fix
+
+Take `stream_map_mutex_` for the read, matching every other access to `streams_`.
+On `main` the shared `streams_empty()` accessor is locked:
+
+```cpp
+auto streams_empty() -> bool
+{
+  const std::lock_guard<std::mutex> lock{ stream_map_mutex_ };
+  return streams_.empty();
+}
+```
+
+## Reproduce
+
+Requirements: a C++ toolchain with ThreadSanitizer (clang or gcc), CMake, and a
+**running Couchbase Server** (tested with 8.0 Enterprise) reachable at
+`couchbase://127.0.0.1` with user `Administrator` / password `password` and a
+bucket named **`store`**.
+
+```bash
+git clone --recurse-submodules https://github.com/JesusTheHun/couchbase-cxx-client
 cd couchbase-cxx-client
-mkdir build
-cmake -S . -B build -DCOUCHBASE_CXX_CLIENT_STATIC_BORINGSSL=ON
-cmake --build build
+git checkout reproduction          # RED  (use 'main' for GREEN)
+git submodule update --init --recursive
+
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DENABLE_SANITIZER_THREAD=ON \
+  -DCOUCHBASE_CXX_CLIENT_BUILD_TESTS=OFF \
+  -DCOUCHBASE_CXX_CLIENT_BUILD_TOOLS=OFF \
+  -DCOUCHBASE_CXX_CLIENT_BUILD_DOCS=OFF \
+  -DCOUCHBASE_CXX_CLIENT_BUILD_EXAMPLES=ON
+cmake --build build --target minimal -j
+
+TSAN_OPTIONS="halt_on_error=1" ./build/examples/minimal
 ```
 
-## Running tests
+The example seeds 100 docs into `store._default._default` and loops range scans
+from several threads (env overrides: `REPRO_THREADS`, `REPRO_ITER`, `REPRO_SEED`).
 
-The tests exist in the `/test` directory. Developers will add more tests and
-will organize this directory soon to differentiate between common test types
-for different testing approaches (for example, `unit tests`,
-`integration tests`, `system tests`).
+### Expected
 
-### Testing (command-line)
+ThreadSanitizer prints `WARNING: ThreadSanitizer: data race`, with the write in
+`streams_.erase` (holding `stream_map_mutex_`) and the previous read being the
+unlocked `streams_.empty()`, on the same `streams_` heap block. The process exits
+non-zero. Reproduced 3/3 in testing.
 
-```shell
-cd build
-export TEST_CONNECTION_STRING=couchbase://127.0.0.1
-export TEST_USERNAME=Administrator
-export TEST_PASSWORD=password
-export TEST_BUCKET=default
-ctest
-```
+To confirm the fix: lock the `streams_empty()` read on this branch (the change on
+[`main`](../../tree/main)) and rerun — ThreadSanitizer reports no race and every
+scan returns the full document count (verified, 0 races over 120 scans).
+
+> Note on the build: stock `enable_sanitizers` adds `-fsanitize` only as an
+> `INTERFACE` property (i.e. to consumers, not to the library's own translation
+> units), so the harness also adds `-fsanitize=thread` to the library target —
+> otherwise the orchestrator is invisible to ThreadSanitizer.
+
+## Affected version
+
+The race is present in `core/range_scan_orchestrator.cxx` on `main`
+(`d93d449`, 2026-06-02) and is byte-identical in tag **1.2.2** (`300daf1`), the
+revision pinned by the `@couchbase/couchbase` Node.js SDK v4.6.1.

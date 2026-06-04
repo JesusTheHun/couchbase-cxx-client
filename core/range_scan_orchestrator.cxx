@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <optional>
 #include <system_error>
 #include <variant>
@@ -443,6 +444,26 @@ public:
           self->streams_[vbucket] = stream;
         }
         self->start_streams(self->concurrency_);
+        // === RACE DEMONSTRATION (ThreadSanitizer) ===
+        // next_item() reads streams_.empty() WITHOUT holding stream_map_mutex_,
+        // while the io thread mutates streams_ UNDER the lock (erase on stream
+        // completion / insert in start_streams). That is a data race; it fires
+        // intermittently in production (the 99/100 drop). The io thread touches
+        // streams_ far more often than the single consumer, so the consumer's
+        // unlocked read is usually evicted from TSan's shadow before a write
+        // checks it. This helper performs the SAME unlocked read as next_item()
+        // continuously so the race is observed deterministically. Remove it and
+        // the race still exists in stock code.
+        {
+          std::thread([self]() {
+            while (!self->repro_stop_.load(std::memory_order_relaxed)) {
+              // Same read as next_item() (via streams_empty()), run continuously
+              // so TSan reliably observes the pre-existing race.
+              bool e = self->streams_empty();
+              asm volatile("" : : "r"(e) : "memory"); // prevent the optimizer eliding the read
+            }
+          }).detach();
+        }
         // Transferring ownership of the range_scan_orchestrator impl to the scan_result
         return cb({}, scan_result(std::move(self)));
       });
@@ -451,6 +472,7 @@ public:
   void cancel() override
   {
     cancelled_ = true;
+    repro_stop_.store(true, std::memory_order_relaxed); // RACE REPRO: stop helper
     for (const auto& [vbucket_id, stream] : streams_) {
       stream->should_cancel();
     }
@@ -485,10 +507,19 @@ public:
     next_item(std::move(callback));
   }
 
+  // Reads streams_.empty(). This is the access at stock next_item() line 491.
+  // BUG (RED): not synchronized, although streams_ is mutated under
+  // stream_map_mutex_ elsewhere. FIX (GREEN): take the lock here.
+  auto streams_empty() -> bool
+  {
+    return streams_.empty();
+  }
+
   template<typename Handler>
   void next_item(Handler&& handler)
   {
-    if (streams_.empty() || cancelled_) {
+    if (streams_empty() || cancelled_) {
+      repro_stop_.store(true, std::memory_order_relaxed); // RACE REPRO: stop helper
       items_.cancel();
       items_.close();
       return handler({}, errc::key_value::range_scan_completed);
@@ -630,6 +661,7 @@ private:
   std::uint16_t concurrency_{ 1 };
   std::size_t item_limit_{ std::numeric_limits<std::size_t>::max() };
   std::atomic<bool> cancelled_{ false };
+  std::atomic<bool> repro_stop_{ false }; // RACE REPRO: stops the helper reader thread
 };
 
 range_scan_orchestrator::range_scan_orchestrator(
