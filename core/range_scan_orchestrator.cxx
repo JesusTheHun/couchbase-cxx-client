@@ -488,7 +488,12 @@ public:
   template<typename Handler>
   void next_item(Handler&& handler)
   {
-    if (streams_.empty() || cancelled_) {
+    bool no_streams;
+    {
+      const std::lock_guard<std::mutex> lock{ stream_map_mutex_ };
+      no_streams = streams_.empty();
+    }
+    if (no_streams || cancelled_) {
       items_.cancel();
       items_.close();
       return handler({}, errc::key_value::range_scan_completed);
